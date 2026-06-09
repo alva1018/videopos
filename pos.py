@@ -3,7 +3,7 @@ import numpy as np
 from pupil_apriltags import Detector
 
 # ==================== 配置 ====================
-camera_params = [0, 0, 640.0, 360.0]   # [fx, fy, cx, cy]  —— 强烈建议标定后替换
+camera_params = [720, 720, 960, 540]   # [fx, fy, cx, cy]  # 相机参数
 tag_size = 0.1                                 # Tag 实际边长（米）
 
 # 创建检测器
@@ -18,7 +18,7 @@ at_detector = Detector(
 )
 
 # 读取视频
-video_path = "pad.mp4"
+video_path = "shoulder1080.mp4"
 cap = cv2.VideoCapture(video_path)
 
 if not cap.isOpened():
