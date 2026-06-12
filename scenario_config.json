@@ -1,12 +1,51 @@
 {
   "description": "Simple offline validation scene: one room, three doors, corridor with a far turn.",
   "map_units": "meters",
+  "map": {
+    "image_path": "floorplan.png",
+    "image_size": [1750, 2495],
+    "units": "meters",
+    "coordinate_system": {
+      "origin": "bottom_left",
+      "x_axis": "right",
+      "y_axis": "up"
+    },
+    "polygon": [[0, 0], [0, 17.17], [8.1, 17.17], [8.1, 0]],
+    "image_bounds_px": [[347, 2355], [347, 118], [1403, 118], [1403, 2355]]
+  },
   "areas": [
     "Room",
     "Door_1",
     "Door_2",
     "Door_3",
     "Corridor"
+  ],
+  "map_regions": [
+    {
+      "name": "Room",
+      "polygon": [[2.45, 3.4], [1.37, 12.2], [6, 11.5], [6, 2.7]],
+      "priority": 1
+    },
+    {
+      "name": "Corridor",
+      "polygon": [[6, 1.35], [6, 13.6], [7.76, 13.6], [7.76, 1.4]],
+      "priority": 1
+    },
+    {
+      "name": "Door_1",
+      "polygon": [[5.75, 3.4], [6.25, 3.4], [6.25, 4.4], [5.75, 4.4]],
+      "priority": 5
+    },
+    {
+      "name": "Door_2",
+      "polygon": [[5.75, 6.7], [6.25, 6.7], [6.25, 7.7], [5.75, 7.7]],
+      "priority": 5
+    },
+    {
+      "name": "Door_3",
+      "polygon": [[5.75, 9.4], [6.25, 9.4], [6.25, 10.4], [5.75, 10.4]],
+      "priority": 5
+    }
   ],
   "doors": {
     "Door_1": {
@@ -23,31 +62,42 @@
     {
       "camera_id": "cam_room_a",
       "video_path": "cam_room_a.mp4",
-      "position": [2.8, 13.9],
+      "position": [1.37, 12.2],
       "camera_params": [720.0, 720.0, 960.0, 540.0],
       "tag_size": 0.1,
+      "homography": {
+        "enabled": true,
+        "projection": "image_to_ground_map",
+        "image_points": [[499, 882], [1134, 663], [1534, 707], [1176, 1075]],
+        "map_points": [[5.8, 10.4], [6, 3.4], [2.45, 4], [1, 10.7]]
+      },
+      "map_visibility": {
+        "name": "cam_room_a_visible_room",
+        "polygon": [[2.45, 3.4], [1.37, 12.2], [6, 11.5], [6, 2.7]]
+      },
+      "projection_image_polygon": [[499, 882], [1134, 663], [1534, 707], [1176, 1075]],
       "areas": [
         {
           "name": "Room",
-          "polygon": [[0, 1042], [1144, 659], [1648, 707], [1920, 1080]],
+          "polygon": [[0, 1042], [1144, 650], [1648, 700], [1920, 1080]],
           "position": [3.8, 8.9],
           "priority": 1
         },
         {
           "name": "Door_1",
-          "polygon": [[1090, 440], [1129, 446], [1131, 642], [1093, 655]],
+          "polygon": [[1060, 610], [1150, 610], [1190, 760], [1020, 760]],
           "position": [7.35, 4.75],
           "priority": 5
         },
         {
           "name": "Door_2",
-          "polygon": [[876, 415], [950, 421], [951, 722], [884, 714]],
+          "polygon": [[820, 680], [1010, 680], [1060, 860], [760, 860]],
           "position": [7.35, 8.35],
           "priority": 5
         },
         {
           "name": "Door_3",
-          "polygon": [[454, 363], [644, 384], [651, 826], [496, 872]],
+          "polygon": [[390, 820], [700, 820], [760, 1080], [300, 1080]],
           "position": [7.35, 11.95],
           "priority": 5
         }
@@ -61,31 +111,37 @@
     {
       "camera_id": "cam_room_b",
       "video_path": "cam_room_b.mp4",
-      "position": [3.2, 4.9],
+      "position": [2.45, 4.0],
       "camera_params": [720.0, 720.0, 960.0, 540.0],
       "tag_size": 0.1,
+      "homography": {
+        "enabled": true,
+        "projection": "image_to_ground_map",
+        "image_points": [[1818, 1045], [588, 718], [329, 729], [132, 1077]],
+        "map_points": [[6, 3.4], [5.8, 10.4], [4, 11.7], [3, 6.7]]
+      },
       "areas": [
         {
           "name": "Room",
-          "polygon": [[0, 710], [440, 672], [1825, 1044], [0, 1080]],
+          "polygon": [[0, 710], [440, 672], [1825, 1044], [1920, 1080], [0, 1080]],
           "position": [3.8, 8.9],
           "priority": 1
         },
         {
           "name": "Door_1",
-          "polygon": [[1493, 296], [1885, 266], [1812, 1043], [1459, 966]],
+          "polygon": [[1450, 860], [1885, 860], [1900, 1080], [1350, 1080]],
           "position": [7.35, 4.75],
           "priority": 5
         },
         {
           "name": "Door_2",
-          "polygon": [[829, 360], [974, 346], [966, 828], [810, 771]],
+          "polygon": [[780, 720], [1010, 720], [1060, 900], [740, 900]],
           "position": [7.35, 8.35],
           "priority": 5
         },
         {
           "name": "Door_3",
-          "polygon": [[573, 389], [630, 385], [629, 692], [581, 709]],
+          "polygon": [[540, 670], [660, 670], [700, 780], [520, 780]],
           "position": [7.35, 11.95],
           "priority": 5
         }
@@ -99,25 +155,31 @@
     {
       "camera_id": "cam_corridor_near",
       "video_path": "cam_corridor_near.mp4",
-      "position": [9.7, 0.9],
+      "position": [8.1, 0.0],
       "camera_params": [720.0, 720.0, 540.0, 960.0],
       "tag_size": 0.1,
+      "homography": {
+        "enabled": true,
+        "projection": "image_to_ground_map",
+        "image_points": [[516, 1732], [960, 1407], [1080, 1920], [710, 1920]],
+        "map_points": [[6, 3.4], [6, 6.7], [7.46, 2.5], [6.88, 2]]
+      },
       "areas": [
         {
           "name": "Corridor",
-          "polygon": [[229,1920], [1075, 1307], [1080, 1920], [1080, 1920]],
+          "polygon": [[229, 1920], [1075, 1307], [1080, 1920]],
           "position": [13.9, 11.1],
           "priority": 1
         },
         {
           "name": "Door_1",
-          "polygon": [[505, 601], [514, 1720], [696, 1594], [700, 665]],
+          "polygon": [[500, 1480], [700, 1480], [710, 1725], [500, 1725]],
           "position": [7.35, 4.75],
           "priority": 5
         },
         {
           "name": "Door_2",
-          "polygon": [[956, 736], [958, 1399], [1027, 1349], [1030, 758]],
+          "polygon": [[940, 1320], [1040, 1320], [1045, 1500], [930, 1500]],
           "position": [7.35, 8.35],
           "priority": 5
         }
@@ -130,9 +192,15 @@
     {
       "camera_id": "cam_corridor_far",
       "video_path": "cam_corridor_far.mp4",
-      "position": [9.5, 19.7],
+      "position": [7.46, 16.4],
       "camera_params": [720.0, 720.0, 540.0, 960.0],
       "tag_size": 0.1,
+      "homography": {
+        "enabled": true,
+        "projection": "image_to_ground_map",
+        "image_points": [[426, 1436], [1073, 1587], [655, 1151], [479, 1066]],
+        "map_points": [[7.76, 13.38], [6, 13.6], [6, 7.7], [7.76, 1.4]]
+      },
       "areas": [
         {
           "name": "Corridor",
@@ -142,19 +210,19 @@
         },
         {
           "name": "Door_1",
-          "polygon": [[604, 897], [613, 893], [606, 1085], [614, 1093]],
+          "polygon": [[595, 1040], [625, 1040], [630, 1120], [590, 1120]],
           "position": [7.35, 4.75],
           "priority": 5
         },
         {
           "name": "Door_2",
-          "polygon": [[637, 880], [653, 873], [640, 1125], [656, 1140]],
+          "polygon": [[630, 1080], [665, 1080], [670, 1160], [625, 1160]],
           "position": [7.35, 8.35],
           "priority": 5
         },
         {
           "name": "Door_3",
-          "polygon": [[686, 855], [715, 842], [689, 1179], [718, 1219]],
+          "polygon": [[675, 1140], [725, 1140], [735, 1240], [665, 1240]],
           "position": [7.35, 11.95],
           "priority": 5
         }

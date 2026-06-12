@@ -30,9 +30,16 @@ class AreaConfig:
 class CameraConfig:
     camera_id: str
     video_path: str
+    position: Point
     camera_params: List[float]
     tag_size: float
     areas: List[AreaConfig]
+    map_regions: List[AreaConfig] = field(default_factory=list)
+    homography: Dict[str, Any] = field(default_factory=dict)
+    homography_matrix: Optional[Any] = None
+    map_visibility_name: str = ""
+    map_visibility_polygon: List[Point] = field(default_factory=list)
+    projection_image_polygon: List[Point] = field(default_factory=list)
     door_rois: Dict[str, List[Point]] = field(default_factory=dict)
 
 
@@ -47,6 +54,15 @@ class LocalTrack:
     area: str = "Unknown"
     position: Point = (0.0, 0.0)
     confidence: float = 0.0
+    ground_pixel: Optional[Point] = None
+    map_position: Optional[Point] = None
+    raw_map_position: Optional[Point] = None
+    last_valid_map_position: Optional[Point] = None
+    last_valid_area: str = "Unknown"
+    projection_valid: Optional[bool] = None
+    map_visibility_valid: Optional[bool] = None
+    map_visibility_name: str = ""
+    localization_method: str = "pixel_area_fallback"
 
 
 @dataclass
@@ -118,6 +134,30 @@ def point_in_polygon(point: Point, polygon: Sequence[Point]) -> bool:
     return inside
 
 
+def point_on_segment(point: Point, a: Point, b: Point, tolerance: float = 1e-6) -> bool:
+    px, py = point
+    ax, ay = a
+    bx, by = b
+    cross = (px - ax) * (by - ay) - (py - ay) * (bx - ax)
+    if abs(cross) > tolerance:
+        return False
+    dot = (px - ax) * (bx - ax) + (py - ay) * (by - ay)
+    if dot < -tolerance:
+        return False
+    length_sq = (bx - ax) ** 2 + (by - ay) ** 2
+    return dot <= length_sq + tolerance
+
+
+def point_in_polygon_inclusive(point: Point, polygon: Sequence[Point], tolerance: float = 1e-6) -> bool:
+    if not polygon:
+        return False
+    for idx, start in enumerate(polygon):
+        end = polygon[(idx + 1) % len(polygon)]
+        if point_on_segment(point, start, end, tolerance):
+            return True
+    return point_in_polygon(point, polygon)
+
+
 def normalize_polygon_points(points: Sequence[Sequence[float]]) -> List[Point]:
     normalized = [(float(point[0]), float(point[1])) for point in points]
     if len(normalized) <= 2:
@@ -149,6 +189,12 @@ def polygon_centroid(polygon: Sequence[Point]) -> Point:
 
 
 def nearest_area_by_pixel(point: Point, areas: Sequence[AreaConfig]) -> Optional[AreaConfig]:
+    if not areas:
+        return None
+    return min(areas, key=lambda area: math.dist(point, polygon_centroid(area.polygon)))
+
+
+def nearest_area_by_map(point: Point, areas: Sequence[AreaConfig]) -> Optional[AreaConfig]:
     if not areas:
         return None
     return min(areas, key=lambda area: math.dist(point, polygon_centroid(area.polygon)))
@@ -229,32 +275,161 @@ def area_for_track(track: LocalTrack, camera: CameraConfig) -> Tuple[str, Point]
             if nearest is None:
                 return "Unknown", foot
             return nearest.name, nearest.position
+    nearest = nearest_area_by_pixel(foot, non_door_areas)
+    if nearest is not None:
+        return nearest.name, nearest.position
+
     nearest = nearest_area_by_pixel(foot, camera.areas)
     if nearest is not None:
         return nearest.name, nearest.position
     return "Unknown", foot
 
 
-def camera_from_dict(raw: Dict[str, Any]) -> CameraConfig:
+def track_ground_pixel(track: LocalTrack, projection: str, head_ground_alpha: float) -> Point:
+    x1, y1, x2, y2 = track.bbox
+    center_x = (x1 + x2) * 0.5
+    if projection == "head_projected":
+        return (center_x, y1 + (y2 - y1) * head_ground_alpha)
+    return (center_x, y2)
+
+
+def ensure_homography_matrix(cv2: Any, camera: CameraConfig) -> Optional[Any]:
+    if camera.homography_matrix is not None:
+        return camera.homography_matrix
+    raw = camera.homography
+    if not raw or not raw.get("enabled", False):
+        return None
+    image_points = raw.get("image_points", [])
+    map_points = raw.get("map_points", [])
+    if len(image_points) < 4 or len(image_points) != len(map_points):
+        return None
+    src = np.array(image_points, dtype=np.float64)
+    dst = np.array(map_points, dtype=np.float64)
+    matrix, _ = cv2.findHomography(src, dst, 0)
+    camera.homography_matrix = matrix
+    return matrix
+
+
+def project_image_point_to_map(point: Point, matrix: Any) -> Optional[Point]:
+    if matrix is None:
+        return None
+    x, y = point
+    vec = np.array([x, y, 1.0], dtype=np.float64)
+    projected = matrix @ vec
+    denom = float(projected[2])
+    if abs(denom) < 1e-9:
+        return None
+    return (float(projected[0] / denom), float(projected[1] / denom))
+
+
+def area_for_map_point(point: Point, areas: Sequence[AreaConfig]) -> Tuple[str, Point]:
+    matches = [area for area in areas if point_in_polygon(point, area.polygon)]
+    if matches:
+        best = max(matches, key=lambda area: area.priority)
+        return best.name, point
+    nearest = nearest_area_by_map(point, areas)
+    if nearest is not None:
+        return nearest.name, point
+    return "Unknown", point
+
+
+def reset_homography_status(track: LocalTrack) -> None:
+    track.ground_pixel = None
+    track.map_position = None
+    track.raw_map_position = None
+    track.projection_valid = None
+    track.map_visibility_valid = None
+    track.map_visibility_name = ""
+
+
+def fallback_localization(track: LocalTrack, camera: CameraConfig, method: str) -> Tuple[str, Point]:
+    if track.last_valid_map_position is not None:
+        track.map_position = track.last_valid_map_position
+        track.map_visibility_name = camera.map_visibility_name
+        track.localization_method = method + "_last_valid"
+        area, position = area_for_map_point(track.last_valid_map_position, camera.map_regions)
+        if area == "Unknown" and track.last_valid_area != "Unknown":
+            return track.last_valid_area, track.last_valid_map_position
+        return area, position
+
+    area, position = area_for_track(track, camera)
+    track.map_position = None
+    track.localization_method = method + "_fallback"
+    return area, position
+
+
+def localize_track(track: LocalTrack, camera: CameraConfig, args: argparse.Namespace) -> Tuple[str, Point]:
+    use_homography = bool(getattr(args, "use_homography", False) or getattr(args, "show_floorplan", False))
+    if not use_homography:
+        area, position = area_for_track(track, camera)
+        reset_homography_status(track)
+        track.localization_method = "pixel_area_fallback"
+        return area, position
+
+    projection = getattr(args, "map_projection", "foot")
+    alpha = float(getattr(args, "head_ground_alpha", 1.15))
+    point = track_ground_pixel(track, projection, alpha)
+    track.ground_pixel = point
+    track.raw_map_position = None
+    track.map_visibility_name = camera.map_visibility_name
+    if camera.projection_image_polygon and not point_in_polygon_inclusive(point, camera.projection_image_polygon, 1.0):
+        track.projection_valid = False
+        track.map_visibility_valid = None
+        return fallback_localization(track, camera, "homography_outside_projection_roi")
+
+    track.projection_valid = True
+    map_point = project_image_point_to_map(point, camera.homography_matrix)
+    if map_point is not None:
+        track.raw_map_position = map_point
+        if camera.map_visibility_polygon and not point_in_polygon_inclusive(map_point, camera.map_visibility_polygon, 1e-4):
+            track.map_visibility_valid = False
+            return fallback_localization(track, camera, "homography_visibility_mismatch")
+
+        track.map_visibility_valid = True
+        track.map_position = map_point
+        track.last_valid_map_position = map_point
+        track.localization_method = "homography_head_projected" if projection == "head_projected" else "homography_foot"
+        area, position = area_for_map_point(map_point, camera.map_regions)
+        track.last_valid_area = area
+        return area, position
+
+    track.map_visibility_valid = None
+    return fallback_localization(track, camera, "homography_projection_failed")
+
+
+def area_config_from_dict(item: Dict[str, Any]) -> AreaConfig:
+    return AreaConfig(
+        name=item["name"],
+        polygon=normalize_polygon_points(item["polygon"]),
+        position=tuple(item.get("position", polygon_centroid(item["polygon"]))),
+        priority=int(item.get("priority", 0)),
+    )
+
+
+def camera_from_dict(raw: Dict[str, Any], map_regions: Optional[Sequence[AreaConfig]] = None) -> CameraConfig:
     areas = [
-        AreaConfig(
-            name=item["name"],
-            polygon=normalize_polygon_points(item["polygon"]),
-            position=tuple(item["position"]),
-            priority=int(item.get("priority", 0)),
-        )
+        area_config_from_dict(item)
         for item in raw.get("areas", [])
     ]
     door_rois = {
         name: normalize_polygon_points(polygon)
         for name, polygon in raw.get("door_rois", {}).items()
     }
+    homography = dict(raw.get("homography", {}))
+    map_visibility = dict(raw.get("map_visibility", {}))
+    projection_image_polygon = raw.get("projection_image_polygon", homography.get("image_points", []))
     return CameraConfig(
         camera_id=raw["camera_id"],
         video_path=raw["video_path"],
+        position=tuple(raw.get("position", (0.0, 0.0))),
         camera_params=[float(v) for v in raw.get("camera_params", [720, 720, 960, 540])],
         tag_size=float(raw.get("tag_size", 0.1)),
         areas=areas,
+        map_regions=list(map_regions or []),
+        homography=homography,
+        map_visibility_name=str(map_visibility.get("name", "")),
+        map_visibility_polygon=normalize_polygon_points(map_visibility.get("polygon", [])),
+        projection_image_polygon=normalize_polygon_points(projection_image_polygon),
         door_rois=door_rois,
     )
 
@@ -372,6 +547,7 @@ def bind_tags_to_tracks(
     tracks: List[LocalTrack],
     timestamp: float,
     camera: CameraConfig,
+    args: argparse.Namespace,
 ) -> List[Dict[str, Any]]:
     observations: List[Dict[str, Any]] = []
     for tag in tags:
@@ -398,7 +574,7 @@ def bind_tags_to_tracks(
 
         track.tag_id = tag["tag_id"]
         track.last_tag_seen_ts = timestamp
-        area, position = area_for_track(track, camera)
+        area, position = localize_track(track, camera, args)
         track.area = area
         track.position = position
         track.confidence = max(track.confidence, 0.92)
@@ -428,7 +604,7 @@ def local_observation(
     if track.last_tag_seen_ts is not None:
         last_tag_seen_ms = int(max(0.0, timestamp - track.last_tag_seen_ts) * 1000)
     state_penalty = 1.0 if state == "CONFIRMED" else 0.62
-    return {
+    row = {
         "timestamp": round(timestamp, 3),
         "camera_id": camera.camera_id,
         "local_track_id": track.local_track_id,
@@ -440,6 +616,20 @@ def local_observation(
         "confidence": round(min(0.99, track.confidence * state_penalty), 3),
         "last_tag_seen_ms": last_tag_seen_ms,
     }
+    row["localization_method"] = track.localization_method
+    if track.ground_pixel is not None:
+        row["ground_pixel"] = [round(track.ground_pixel[0], 1), round(track.ground_pixel[1], 1)]
+    if track.raw_map_position is not None:
+        row["raw_map_position"] = [round(track.raw_map_position[0], 3), round(track.raw_map_position[1], 3)]
+    if track.map_position is not None:
+        row["map_position"] = [round(track.map_position[0], 3), round(track.map_position[1], 3)]
+    if track.projection_valid is not None:
+        row["projection_valid"] = track.projection_valid
+    if track.map_visibility_valid is not None:
+        row["map_visibility_valid"] = track.map_visibility_valid
+    if track.map_visibility_name:
+        row["map_visibility"] = track.map_visibility_name
+    return row
 
 
 def color_for_name(name: str) -> Tuple[int, int, int]:
@@ -483,6 +673,119 @@ def draw_text(
     cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
 
 
+def map_bounds_from_config(config: Dict[str, Any]) -> Optional[Tuple[float, float, float, float, float, float, float, float]]:
+    map_config = config.get("map", {})
+    polygon = map_config.get("polygon", [])
+    image_bounds = map_config.get("image_bounds_px", [])
+    if len(polygon) < 4 or len(image_bounds) < 4:
+        return None
+    xs = [float(point[0]) for point in polygon]
+    ys = [float(point[1]) for point in polygon]
+    left = float(image_bounds[1][0])
+    top = float(image_bounds[1][1])
+    right = float(image_bounds[2][0])
+    bottom = float(image_bounds[0][1])
+    return (min(xs), min(ys), max(xs), max(ys), left, top, right, bottom)
+
+
+def map_point_to_floorplan_pixel(point: Point, config: Dict[str, Any]) -> Optional[Point]:
+    bounds = map_bounds_from_config(config)
+    if bounds is None:
+        return None
+    map_min_x, map_min_y, map_max_x, map_max_y, left, top, right, bottom = bounds
+    map_w = map_max_x - map_min_x
+    map_h = map_max_y - map_min_y
+    if abs(map_w) < 1e-9 or abs(map_h) < 1e-9:
+        return None
+    x, y = point
+    px = left + (x - map_min_x) / map_w * (right - left)
+    py = bottom - (y - map_min_y) / map_h * (bottom - top)
+    return (px, py)
+
+
+def map_polygon_to_floorplan_pixels(polygon: Sequence[Point], config: Dict[str, Any]) -> List[Point]:
+    pixels: List[Point] = []
+    for point in polygon:
+        pixel = map_point_to_floorplan_pixel(point, config)
+        if pixel is not None:
+            pixels.append(pixel)
+    return pixels
+
+
+def draw_floorplan_overlay(
+    cv2: Any,
+    floorplan_base: Any,
+    config: Dict[str, Any],
+    states: Sequence[VisualCameraState],
+) -> Any:
+    floorplan = floorplan_base.copy()
+    bounds = map_bounds_from_config(config)
+    if bounds is not None:
+        _, _, _, _, left, top, right, bottom = bounds
+        draw_polyline(
+            cv2,
+            floorplan,
+            [(left, bottom), (left, top), (right, top), (right, bottom)],
+            (0, 255, 255),
+            4,
+        )
+
+    map_regions = states[0].camera.map_regions if states else []
+    for region in map_regions:
+        color = color_for_name(region.name)
+        pixels = map_polygon_to_floorplan_pixels(region.polygon, config)
+        draw_polyline(cv2, floorplan, pixels, color, 2)
+        if pixels:
+            px, py = pixels[0]
+            draw_text(cv2, floorplan, region.name, (int(px), int(py) - 8), color, 0.55)
+
+    for state in states:
+        visibility_pixels = map_polygon_to_floorplan_pixels(state.camera.map_visibility_polygon, config)
+        if visibility_pixels:
+            draw_polyline(cv2, floorplan, visibility_pixels, (255, 180, 40), 5)
+            px, py = visibility_pixels[0]
+            label = state.camera.map_visibility_name or f"{state.camera.camera_id} visible"
+            draw_text(cv2, floorplan, label, (int(px), int(py) - 12), (255, 180, 40), 0.55)
+
+        camera_pixel = map_point_to_floorplan_pixel(state.camera.position, config)
+        if camera_pixel is not None:
+            cx, cy = int(camera_pixel[0]), int(camera_pixel[1])
+            cv2.circle(floorplan, (cx, cy), 9, (0, 255, 255), -1, cv2.LINE_AA)
+            draw_text(cv2, floorplan, state.camera.camera_id, (cx + 12, cy - 8), (0, 255, 255), 0.55)
+
+        for track in state.tracks:
+            raw_marker = None
+            if track.raw_map_position is not None:
+                raw_marker = map_point_to_floorplan_pixel(track.raw_map_position, config)
+            if track.map_position is None:
+                if raw_marker is not None:
+                    rx, ry = int(raw_marker[0]), int(raw_marker[1])
+                    cv2.line(floorplan, (rx - 8, ry - 8), (rx + 8, ry + 8), (0, 0, 255), 2, cv2.LINE_AA)
+                    cv2.line(floorplan, (rx + 8, ry - 8), (rx - 8, ry + 8), (0, 0, 255), 2, cv2.LINE_AA)
+                continue
+            marker = map_point_to_floorplan_pixel(track.map_position, config)
+            if marker is None:
+                continue
+            mx, my = int(marker[0]), int(marker[1])
+            color = color_for_person(track.tag_id)
+            if "last_valid" in track.localization_method:
+                color = tuple(int(channel * 0.65) for channel in color)
+            if raw_marker is not None and track.map_visibility_valid is False:
+                rx, ry = int(raw_marker[0]), int(raw_marker[1])
+                cv2.line(floorplan, (rx - 8, ry - 8), (rx + 8, ry + 8), (0, 0, 255), 2, cv2.LINE_AA)
+                cv2.line(floorplan, (rx + 8, ry - 8), (rx - 8, ry + 8), (0, 0, 255), 2, cv2.LINE_AA)
+                cv2.line(floorplan, (rx, ry), (mx, my), (120, 120, 255), 1, cv2.LINE_AA)
+            cv2.circle(floorplan, (mx, my), 11, color, -1, cv2.LINE_AA)
+            cv2.circle(floorplan, (mx, my), 15, (0, 0, 0), 2, cv2.LINE_AA)
+            label_id = f"id:{track.tag_id}" if track.tag_id is not None else f"t{track.local_track_id}"
+            label = f"{label_id} {track.area} ({track.map_position[0]:.2f},{track.map_position[1]:.2f})"
+            draw_text(cv2, floorplan, label, (mx + 16, my - 10), color, 0.55)
+            draw_text(cv2, floorplan, track.localization_method, (mx + 16, my + 14), (230, 230, 230), 0.45)
+
+    draw_text(cv2, floorplan, "floorplan map", (18, 32), (255, 255, 255), 0.75)
+    return floorplan
+
+
 def draw_debug_overlays(
     cv2: Any,
     frame: Any,
@@ -506,6 +809,11 @@ def draw_debug_overlays(
             if polygon:
                 px, py = polygon[0]
                 draw_text(cv2, frame, f"ROI {name}", (int(px), int(py) - 18), (0, 255, 255), 0.5)
+
+    if camera.projection_image_polygon:
+        draw_polyline(cv2, frame, camera.projection_image_polygon, (255, 180, 40), 3)
+        px, py = camera.projection_image_polygon[0]
+        draw_text(cv2, frame, "homography ROI", (int(px), int(py) - 12), (255, 180, 40), 0.5)
 
     if toggles["tag_rois"]:
         for roi in state.last_tag_rois:
@@ -540,6 +848,11 @@ def draw_debug_overlays(
         source = "YOLO" if track.is_real_person else "TAG"
         label = f"t{track.local_track_id} {label_id} {track_state} {track.area} {source}"
         draw_text(cv2, frame, label, (x1, max(18, y1 - 8)), color, 0.55)
+        if track.map_position is not None:
+            map_label = f"map ({track.map_position[0]:.2f},{track.map_position[1]:.2f}) {track.localization_method}"
+            draw_text(cv2, frame, map_label, (x1, min(frame.shape[0] - 12, y2 + 22)), color, 0.5)
+        elif track.localization_method.startswith("homography_"):
+            draw_text(cv2, frame, track.localization_method, (x1, min(frame.shape[0] - 12, y2 + 22)), (0, 0, 255), 0.5)
 
     yolo_status = "ON" if args.yolo_model else "OFF"
     draw_text(
@@ -583,6 +896,14 @@ def make_grid(cv2: Any, tiles: Sequence[Any], width: int, height: int) -> Any:
     return cv2.vconcat([top, bottom])
 
 
+def seek_capture_to_start(cv2: Any, cap: Any, fps: float, start_sec: float) -> int:
+    if start_sec <= 0:
+        return -1
+    start_frame = max(0, int(round(start_sec * fps)))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    return start_frame - 1
+
+
 def draw_fused_summary(cv2: Any, grid: Any, fused_rows: Sequence[Dict[str, Any]]) -> None:
     x, y = 18, 34
     draw_text(cv2, grid, "FUSED", (x, y), (255, 255, 255), 0.65)
@@ -612,8 +933,10 @@ def process_camera(
     if not cap.isOpened():
         print(f"{camera.camera_id}: could not open video, skipped: {video_path}")
         return []
+    ensure_homography_matrix(cv2, camera)
 
     fps = cap.get(cv2.CAP_PROP_FPS) or args.default_fps
+    frame_idx = seek_capture_to_start(cv2, cap, fps, args.start_sec)
     detector = Detector(
         families=args.tag_family,
         nthreads=args.apriltag_threads,
@@ -627,8 +950,7 @@ def process_camera(
     observations: List[Dict[str, Any]] = []
     tracks: List[LocalTrack] = []
     next_track_id = 1
-    frame_idx = -1
-    next_output_sec = 0
+    next_output_sec = int(args.start_sec)
 
     while True:
         ok, frame = cap.read()
@@ -669,14 +991,14 @@ def process_camera(
                         camera.tag_size,
                     )
                 )
-            observations.extend(bind_tags_to_tracks(tags, tracks, timestamp, camera))
+            observations.extend(bind_tags_to_tracks(tags, tracks, timestamp, camera, args))
 
         current_sec = int(timestamp)
         if current_sec >= next_output_sec:
             for track in tracks:
                 state = state_for_track(track, timestamp)
                 if state:
-                    area, position = area_for_track(track, camera)
+                    area, position = localize_track(track, camera, args)
                     track.area = area
                     track.position = position
                     observations.append(local_observation(camera, track, timestamp, state))
@@ -705,7 +1027,9 @@ def open_visual_states(
         if not cap.isOpened():
             print(f"{camera.camera_id}: could not open video, skipped: {video_path}")
             continue
+        ensure_homography_matrix(cv2, camera)
         fps = cap.get(cv2.CAP_PROP_FPS) or args.default_fps
+        frame_idx = seek_capture_to_start(cv2, cap, fps, args.start_sec)
         detector = Detector(
             families=args.tag_family,
             nthreads=args.apriltag_threads,
@@ -715,7 +1039,16 @@ def open_visual_states(
             decode_sharpening=0.25,
             debug=0,
         )
-        states.append(VisualCameraState(camera=camera, cap=cap, fps=fps, detector=detector))
+        states.append(
+            VisualCameraState(
+                camera=camera,
+                cap=cap,
+                fps=fps,
+                detector=detector,
+                frame_idx=frame_idx,
+                next_output_sec=int(args.start_sec),
+            )
+        )
     return states
 
 
@@ -770,7 +1103,7 @@ def process_visual_frame(
                 )
             )
         state.last_tags = tags
-        new_observations = bind_tags_to_tracks(tags, state.tracks, timestamp, state.camera)
+        new_observations = bind_tags_to_tracks(tags, state.tracks, timestamp, state.camera, args)
         observations.extend(new_observations)
 
     current_sec = int(timestamp)
@@ -778,7 +1111,7 @@ def process_visual_frame(
         for track in state.tracks:
             track_state = state_for_track(track, timestamp)
             if track_state:
-                area, position = area_for_track(track, state.camera)
+                area, position = localize_track(track, state.camera, args)
                 track.area = area
                 track.position = position
                 observations.append(local_observation(state.camera, track, timestamp, track_state))
@@ -799,6 +1132,15 @@ def run_visualization(
     if not states:
         print("No videos could be opened for visualization.")
         return 1
+    floorplan_base = None
+    if args.show_floorplan:
+        map_path = config.get("map", {}).get("image_path")
+        if map_path:
+            if not os.path.isabs(map_path):
+                map_path = os.path.join(args.base_dir, map_path)
+            floorplan_base = cv2.imread(map_path)
+            if floorplan_base is None:
+                print(f"Could not load floorplan image: {map_path}")
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.debug_output_dir, exist_ok=True)
@@ -811,11 +1153,12 @@ def run_visualization(
         "door_rois": args.show_door_rois,
         "tag_rois": args.show_tag_rois,
         "fused": args.show_fused,
+        "floorplan": args.show_floorplan,
     }
     all_observations: List[Dict[str, Any]] = []
     latest_fused: List[Dict[str, Any]] = []
 
-    print("Controls: Space pause/play | N step | Q/Esc quit | P polygons | D doors | T tag ROIs | F fused | S screenshot")
+    print("Controls: Space pause/play | N step | Q/Esc quit | P polygons | D doors | T tag ROIs | F fused | M floorplan | S screenshot")
     try:
         while states:
             advance = (not paused) or step_once
@@ -843,7 +1186,12 @@ def run_visualization(
                 timestamp = max(0.0, state.frame_idx / state.fps) if state.frame_idx >= 0 else 0.0
                 draw_debug_overlays(cv2, frame, state, timestamp, args, toggles)
                 tiles.append(resize_tile(cv2, frame, args.vis_width, args.vis_height))
-            grid = make_grid(cv2, tiles, args.vis_width, args.vis_height)
+            if toggles["floorplan"] and floorplan_base is not None and len(states) == 1 and tiles:
+                floorplan = draw_floorplan_overlay(cv2, floorplan_base, config, states)
+                map_tile = resize_tile(cv2, floorplan, args.vis_width, args.vis_height)
+                grid = cv2.hconcat([tiles[0], map_tile])
+            else:
+                grid = make_grid(cv2, tiles, args.vis_width, args.vis_height)
             if toggles["fused"]:
                 draw_fused_summary(cv2, grid, latest_fused)
             if paused:
@@ -866,6 +1214,8 @@ def run_visualization(
                 toggles["tag_rois"] = not toggles["tag_rois"]
             elif key in (ord("f"), ord("F")):
                 toggles["fused"] = not toggles["fused"]
+            elif key in (ord("m"), ord("M")):
+                toggles["floorplan"] = not toggles["floorplan"]
             elif key in (ord("s"), ord("S")):
                 screenshot_idx += 1
                 path = os.path.join(args.debug_output_dir, f"debug_{screenshot_idx:04d}.jpg")
@@ -1037,10 +1387,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--yolo-model", default=None)
+    parser.add_argument("--camera-id", default=None)
     parser.add_argument("--yolo-fps", type=float, default=2.0)
     parser.add_argument("--yolo-conf", type=float, default=0.35)
     parser.add_argument("--tag-fps", type=float, default=2.0)
     parser.add_argument("--frame-step", type=int, default=1)
+    parser.add_argument("--start-sec", type=float, default=0.0)
     parser.add_argument("--default-fps", type=float, default=30.0)
     parser.add_argument("--track-iou", type=float, default=0.25)
     parser.add_argument("--tag-family", default="tag36h11")
@@ -1054,6 +1406,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--show-door-rois", action="store_true", default=True)
     parser.add_argument("--show-tag-rois", action="store_true", default=True)
     parser.add_argument("--show-fused", action="store_true", default=True)
+    parser.add_argument("--show-floorplan", action="store_true")
+    parser.add_argument("--use-homography", action="store_true")
+    parser.add_argument("--map-projection", choices=["foot", "head_projected"], default="foot")
+    parser.add_argument("--head-ground-alpha", type=float, default=1.15)
     parser.add_argument("--debug-output-dir", default="outputs_debug")
     return parser.parse_args()
 
@@ -1062,7 +1418,13 @@ def main() -> int:
     args = parse_args()
     config = load_config(args.config)
     validate_config(config)
-    cameras = [camera_from_dict(item) for item in config["cameras"]]
+    map_regions = [area_config_from_dict(item) for item in config.get("map_regions", [])]
+    cameras = [camera_from_dict(item, map_regions) for item in config["cameras"]]
+    if args.camera_id:
+        cameras = [camera for camera in cameras if camera.camera_id == args.camera_id]
+        if not cameras:
+            print(f"No camera matched --camera-id {args.camera_id}")
+            return 1
 
     print(f"Loaded {len(cameras)} cameras from {args.config}")
     if args.dry_run:
